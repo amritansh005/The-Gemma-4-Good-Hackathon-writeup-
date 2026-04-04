@@ -1,0 +1,31 @@
+# ── Core ─────────────────────────────────────────────────────────
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+requests
+redis
+
+# ── OpenVoice-lite backend (primary) ───────────────────────────────
+# MeloTTS runtime used by OpenVoice ecosystem (lightweight)
+# Install PyTorch for your CUDA version FIRST when using GPU:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+MeloTTS
+
+# ── Prosody post-processing ───────────────────────────────────────
+# librosa: time-stretch + pitch-shift on top of OpenVoice output
+# Falls back to numpy-only rate control if not installed
+librosa
+soundfile
+
+# ── Audio playback (client-side, for tts_client.py) ──────────────
+sounddevice
+numpy
+
+# ── System TTS last-resort fallback in tts_client.py ─────────────
+# pip install pyttsx3
+# Optional — only used if service backend is unavailable
+
+# ── Dev / testing ─────────────────────────────────────────────────
+# pytest
+# httpx  # for FastAPI TestClient async

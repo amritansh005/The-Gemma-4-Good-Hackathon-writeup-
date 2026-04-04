@@ -1,0 +1,13 @@
+faster-whisper
+numpy
+sounddevice
+scipy
+webrtcvad-wheels
+fastapi
+uvicorn
+python-multipart
+requests
+python-dotenv
+funasr
+modelscope
+PyQt6
