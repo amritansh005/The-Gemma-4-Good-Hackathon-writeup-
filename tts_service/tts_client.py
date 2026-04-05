@@ -199,14 +199,22 @@ class TTSClient:
             finally:
                 self._set_playback_state(False, "")
         elif remaining_chunks:
-            # Interrupted between chunks — play remaining chunks
+            # Interrupted between chunks — play remaining chunks.
+            # Clear _stop_event first: it was set by the interruption
+            # that triggered this resume.  Without clearing it,
+            # _play_remaining_chunks would see it on its first
+            # iteration and abort immediately (played 0/N).
             logger.info(
                 "TTS resuming playback from remaining chunks | chunks=%d",
                 len(remaining_chunks),
             )
-            self._play_remaining_chunks(
-                remaining_chunks, emotion, session_id, full_text
-            )
+            self._set_playback_state(True, full_text)
+            try:
+                self._play_remaining_chunks(
+                    remaining_chunks, emotion, session_id, full_text
+                )
+            finally:
+                self._set_playback_state(False, "")
 
     def _play_remaining_chunks(
         self,

@@ -1,0 +1,31 @@
+1. To start OLLAMA:
+
+ollama serve
+
+2. Teacher LLM:
+
+conda create -n ai-teacher python=3.10 -y
+cd "C:\Users\DELL\Desktop\Google hackathon\teacher_llm"
+conda activate ai-teacher
+uvicorn app.main:app --reload
+
+3. Whisper environment:
+
+conda create -n whisper-env python=3.10 -y- (Python version: Python 3.10.20)
+cd "C:\Users\DELL\Desktop\Google hackathon\STT"
+conda activate whisper-env
+uvicorn app.main:app --host 0.0.0.0 --port 8001
+
+4. tTS environment:
+
+conda create -n shikshak_tts python=3.10 -y
+cd "C:\Users\DELL\Desktop\Google hackathon\tts_service" 
+conda activate shikshak_tts
+uvicorn app.main:app --host 0.0.0.0 --port 5000 --workers 1
+
+5. Start frontend:
+
+conda create -n shikshak_gui python=3.10 -y
+cd "C:\Users\DELL\Desktop\Google hackathon\shikshak_pyqt6_desktop_app\desktop_teacher_app"
+conda activate shikshak_gui
+python main.py

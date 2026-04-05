@@ -44,17 +44,6 @@ logger = logging.getLogger(__name__)
 # -------------------------------------------------------------------------
 # SAFE GLOBAL PRINT CAPTURE DISPATCH
 # -------------------------------------------------------------------------
-# Why this exists:
-# The old version monkey-patched builtins.print with a bound instance method:
-#     builtins.print = self._capture_print
-# That can break some code paths which expect the capture callable to exist
-# at module scope, causing warnings like:
-#     module 'gui_app.workers.live_session_worker' has no attribute '_capture_print'
-#
-# To preserve all current behavior without changing functionality, we route
-# print() through a module-level dispatcher and let the active PrintCapture
-# instance handle the text.
-# -------------------------------------------------------------------------
 _ORIGINAL_PRINT = builtins.print
 _ACTIVE_PRINT_CAPTURE: Optional["PrintCapture"] = None
 _PRINT_CAPTURE_LOCK = threading.RLock()
@@ -75,12 +64,23 @@ class PrintCapture:
     """
     Temporarily intercept print() calls from finalize_turn to extract
     student text, teacher text, and emotion for the GUI signals.
+
+    IMPORTANT: finalize_turn() spawns _bg_stream_tts_and_memory as a
+    daemon thread and returns immediately.  The Teacher+ / Teacher:
+    prints happen on that bg thread AFTER finalize_turn returns.
+    Therefore PrintCapture must stay active until the bg TTS thread
+    finishes.  We track this with `self.done` — the event loop
+    checks it when TTS stops playing and only then calls __exit__.
     """
 
     def __init__(self, worker: "LiveSessionWorker") -> None:
         self.worker = worker
         self.saw_teacher_reply = False
         self.saw_tts_resume = False
+        self.saw_final_teacher = False
+        self.saw_valid_student = False  # "You: ..." printed → bg TTS thread spawned
+        self.tts_has_stopped = False    # event loop sets when TTS playing→stopped
+        self.done = False  # set True when safe to release
 
     def __enter__(self):
         global _ACTIVE_PRINT_CAPTURE
@@ -96,6 +96,11 @@ class PrintCapture:
                 _ACTIVE_PRINT_CAPTURE = None
             builtins.print = _ORIGINAL_PRINT
 
+    def release(self):
+        """Mark this capture as done and deactivate it."""
+        self.done = True
+        self.__exit__(None, None, None)
+
     def handle_print(self, *args, **kwargs) -> None:
         text = " ".join(str(a) for a in args)
 
@@ -108,21 +113,28 @@ class PrintCapture:
             if student_text:
                 self.worker.final_student_text.emit(student_text)
                 self.worker.live_student_text.emit("")
+                self.saw_valid_student = True
 
         elif text.startswith("Teacher+ "):
             streamed_text = text[9:].strip()
             if streamed_text:
                 self.worker.live_teacher_text.emit(streamed_text)
-                self.worker.status_changed.emit("Speaking")
+                # Emit "Speaking" to cover the gap between first LLM
+                # sentence arriving and TTS actually starting playback.
+                # BUT only if TTS hasn't already stopped — otherwise a
+                # late Teacher+ would re-set status to "Speaking" after
+                # the event loop already switched to "Listening".
+                if not self.tts_has_stopped:
+                    self.worker.status_changed.emit("Speaking")
                 self.saw_teacher_reply = True
 
         elif text.startswith("Teacher: "):
             teacher_text = text[9:].strip()
             if teacher_text:
                 self.worker.final_teacher_text.emit(teacher_text)
-                self.worker.live_teacher_text.emit(teacher_text)
-                self.worker.status_changed.emit("Speaking")
+                self.worker.live_teacher_text.emit("")
                 self.saw_teacher_reply = True
+                self.saw_final_teacher = True
 
         elif text.strip().startswith("[text:"):
             # Emotion line like: [text: neutral | voice: sad (50%) | ...]
@@ -130,6 +142,7 @@ class PrintCapture:
 
         elif "[Assistant interrupted" in text:
             self.worker.note_changed.emit("Assistant interrupted by student")
+            self.worker.status_changed.emit("Listening")
 
         elif "Listening..." in text:
             self.worker.status_changed.emit("Listening")
@@ -258,20 +271,9 @@ class LiveSessionWorker(QObject):
             vcc.print_live = gui_print_live
 
             # ── Main event loop ──
-            # The event loop NEVER blocks. finalize_turn runs in a
-            # background thread (Option A) so VAD events keep flowing,
-            # enabling real-time interruption detection at all times.
-
-            # Track whether we already emitted "Listening" for the
-            # current interruption so we don't spam the signal on
-            # every frame.
             _interruption_listening_emitted = False
-
-            # Track TTS playback state to emit Speaking/Listening
-            # transitions directly from the event loop. This is more
-            # reliable than PrintCapture which exits before bg-stream-tts
-            # finishes.
             _last_tts_playing = False
+            _active_capture: Optional[PrintCapture] = None
 
             try:
                 for event in streamer.stream_events():
@@ -279,15 +281,19 @@ class LiveSessionWorker(QObject):
                         break
 
                     # ── TTS state tracking ──
-                    # Check every frame whether TTS started/stopped and
-                    # update the GUI status accordingly.
                     _tts_now = vcc._tts_is_playing()
                     if _tts_now and not _last_tts_playing:
                         # TTS just started playing
                         self.status_changed.emit("Speaking")
                     elif not _tts_now and _last_tts_playing:
-                        # TTS just stopped — revert to Listening unless
-                        # an interruption is being processed
+                        # TTS just stopped playing.
+                        # Mark on the capture so Teacher+ won't re-set
+                        # status to Speaking after this point.
+                        if _active_capture is not None:
+                            _active_capture.tts_has_stopped = True
+
+                        # Revert to Listening unless an interruption is
+                        # being processed.
                         with state.lock:
                             is_finalizing = state.finalizing
                             is_interrupted = state.interruption.confirmed
@@ -295,18 +301,37 @@ class LiveSessionWorker(QObject):
                             self.status_changed.emit("Listening")
                     _last_tts_playing = _tts_now
 
+                    # ── Deferred PrintCapture cleanup ──
+                    if _active_capture is not None:
+                        cap = _active_capture
+                        should_release = False
+
+                        if cap.done:
+                            should_release = True
+                        elif cap.saw_final_teacher:
+                            should_release = True
+
+                        if should_release:
+                            _active_capture = None
+                            self.live_teacher_text.emit("")
+                            cap.release()
+                            # Ensure Listening after full cycle completes
+                            if not cap.done and not self._stop_requested:
+                                with state.lock:
+                                    is_finalizing = state.finalizing
+                                    is_interrupted = state.interruption.confirmed
+                                if not is_finalizing and not is_interrupted:
+                                    self.status_changed.emit("Listening")
+
                     # finalize_turn (bg thread) cannot safely call
                     # streamer.reset() — do it here on the main thread.
                     with state.lock:
                         if state.needs_streamer_reset:
                             state.needs_streamer_reset = False
                             streamer.reset()
-                            # After a reset, clear the flag so the next
-                            # interruption can trigger "Listening" again.
                             _interruption_listening_emitted = False
 
-                    # Interruption handling — runs on EVERY speech_frame,
-                    # even while finalize_turn is running in background
+                    # Interruption handling
                     if event.event_type == "speech_frame":
                         vcc.maybe_handle_tts_interruption(
                             state=state,
@@ -315,11 +340,6 @@ class LiveSessionWorker(QObject):
                             noise_gate=streamer.noise_gate,
                         )
 
-                        # Check if the interruption was just confirmed
-                        # by the background ASR thread. The print
-                        # "[Assistant interrupted by user]" happens on
-                        # that thread and PrintCapture may not see it,
-                        # so we detect it directly from state.
                         with state.lock:
                             just_confirmed = (
                                 state.interruption.confirmed
@@ -334,11 +354,6 @@ class LiveSessionWorker(QObject):
                         with state.lock:
                             if not state.turn.speech_active and not state.finalizing:
                                 turn_manager.start_turn(state.turn)
-                                # Only show "Listening" if TTS is NOT playing.
-                                # During TTS playback, keep showing "Speaking"
-                                # until the interruption is confirmed and TTS
-                                # actually stops — detected above via
-                                # state.interruption.confirmed.
                                 if not vcc._tts_is_playing():
                                     self.status_changed.emit("Listening")
                                 self.note_changed.emit("Student speech detected")
@@ -362,12 +377,14 @@ class LiveSessionWorker(QObject):
                         if decision.action == "finalize":
                             self.status_changed.emit("Thinking")
 
-                            # ── Option A: run finalize_turn in background ──
-                            # PrintCapture intercepts print() from the bg
-                            # thread and emits GUI signals. The event loop
-                            # keeps running so VAD can detect interruptions.
+                            # Release any stale capture from a previous turn
+                            if _active_capture is not None:
+                                _active_capture.release()
+                                _active_capture = None
+
                             capture = PrintCapture(self)
                             capture.__enter__()
+                            _active_capture = capture
 
                             def _finalize_bg(cap=capture):
                                 try:
@@ -384,18 +401,14 @@ class LiveSessionWorker(QObject):
                                     logger.exception("finalize_turn failed")
                                     self.error_occurred.emit(str(exc))
                                 finally:
-                                    cap.__exit__(None, None, None)
                                     self.live_student_text.emit("")
-                                    # Only revert to Listening if teacher
-                                    # didn't reply (filtered/hallucinated)
-                                    # AND TTS isn't resuming from a false
-                                    # interruption.
                                     if (
-                                        not self._stop_requested
-                                        and not cap.saw_teacher_reply
+                                        not cap.saw_valid_student
                                         and not cap.saw_tts_resume
                                     ):
-                                        self.status_changed.emit("Listening")
+                                        cap.done = True
+                                        if not self._stop_requested:
+                                            self.status_changed.emit("Listening")
 
                             threading.Thread(
                                 target=_finalize_bg,
@@ -408,10 +421,6 @@ class LiveSessionWorker(QObject):
                             with state.lock:
                                 had_interruption = state.interruption.confirmed
                             if had_interruption and vcc._tts_has_resume_audio():
-                                # Resume TTS on a background thread so the
-                                # main event loop keeps processing VAD events
-                                # — the user must be able to interrupt the
-                                # resumed playback.
                                 self.note_changed.emit("Resuming teacher speech")
                                 self.status_changed.emit("Speaking")
                                 state.reset()
@@ -447,7 +456,9 @@ class LiveSessionWorker(QObject):
                 logger.exception("Voice chat loop failed")
                 self.error_occurred.emit(str(exc))
             finally:
-                # Restore monkey-patch
+                if _active_capture is not None:
+                    _active_capture.release()
+                    _active_capture = None
                 vcc.print_live = original_print_live
 
         except Exception as exc:
