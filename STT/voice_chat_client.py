@@ -48,6 +48,16 @@ except Exception as _tts_err:
     logger.info("TTSClient not available (%s) — running text-only mode", _tts_err)
 
 
+# ── Background TTS thread generation tracking ─────────────────────────────
+# Each finalize_turn spawns a bg thread for LLM streaming + TTS.  If the
+# user speaks multiple times before the previous bg thread finishes, we
+# can end up with multiple threads all trying to play TTS simultaneously.
+# This counter lets each thread know if it has been superseded by a newer
+# one so it can silently exit instead of playing overlapping audio.
+_bg_tts_generation: int = 0
+_bg_tts_generation_lock = threading.Lock()
+
+
 HALLUCINATION_BLOCKLIST = {
     "bye", "bye bye", "goodbye", "thank you", "thanks",
     "thanks for watching", "thank you for watching",
@@ -263,6 +273,7 @@ class InterruptionState:
         self.partial_confirm_in_flight: bool = False
         self.vad_asr_delegated: bool = False
         self.candidate_id: int = 0
+        self._retry_requested: bool = False
 
     def reset(self) -> None:
         self.active = False
@@ -276,6 +287,7 @@ class InterruptionState:
         self.frames_seen = 0
         self.partial_confirm_in_flight = False
         self.vad_asr_delegated = False
+        self._retry_requested = False
         # NOTE: candidate_id intentionally NOT reset — it only increments
 
     def begin_candidate(self, tts_text: str) -> None:
@@ -290,6 +302,7 @@ class InterruptionState:
         self.frames_seen = 0
         self.partial_confirm_in_flight = False
         self.vad_asr_delegated = False
+        self._retry_requested = False
         self.candidate_id += 1
 
 
@@ -421,6 +434,10 @@ def _run_partial_interrupt_confirmation(
         # NOTE: state.finalizing is NOT checked — the user must be able
         # to interrupt TTS running on the bg thread inside finalize_turn.
         if state.interruption.partial_confirm_in_flight:
+            # A previous ASR attempt is still running.  Don't launch
+            # another one — but record that a retry was requested so
+            # we can try again with more audio when it finishes.
+            state.interruption._retry_requested = True
             return
         candidate_ms = state.interruption.candidate_speech_ms
         if candidate_ms < partial_asr_threshold_ms:
@@ -431,6 +448,7 @@ def _run_partial_interrupt_confirmation(
         tts_text_snapshot = state.interruption.tts_text_snapshot
         candidate_id = state.interruption.candidate_id
         state.interruption.partial_confirm_in_flight = True
+        state.interruption._retry_requested = False
 
     def worker() -> None:
         try:
@@ -496,6 +514,25 @@ def _run_partial_interrupt_confirmation(
                 state.interruption.partial_confirm_in_flight = False
                 if not state.interruption.confirmed:
                     state.interruption.vad_asr_delegated = False
+                    # ── Retry with more audio if requested ──
+                    # While this worker was running, more speech frames
+                    # accumulated.  If a retry was requested (another
+                    # call to _run_partial_interrupt_confirmation came
+                    # in while we were busy), launch a new attempt now
+                    # with the updated, longer audio.
+                    should_retry = (
+                        state.interruption.active
+                        and not state.interruption.confirmed
+                        and getattr(state.interruption, '_retry_requested', False)
+                    )
+                    state.interruption._retry_requested = False
+
+            if should_retry:
+                logger.info(
+                    "Retrying partial ASR confirmation with more audio | speech_ms=%.1f",
+                    state.interruption.candidate_speech_ms,
+                )
+                _run_partial_interrupt_confirmation(state, stt, 0.0)
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -875,11 +912,27 @@ def finalize_turn(
 
         # Stop any currently-playing TTS from a previous turn's bg thread.
         # This prevents overlapping audio when the user speaks multiple
-        # short turns in rapid succession.
+        # short turns in rapid succession.  sd.stop() inside
+        # _tts_stop_playback() kills audio at the hardware level
+        # immediately, and the stale thread's sentence iterator will
+        # call _tts_stop_playback() again if it detects staleness.
         _tts_stop_playback()
+
+        # ── Increment generation so stale bg threads know to exit ──
+        global _bg_tts_generation
+        with _bg_tts_generation_lock:
+            _bg_tts_generation += 1
+            my_generation = _bg_tts_generation
 
         def _bg_stream_tts_and_memory():
             import queue as _queue
+
+            # ── Staleness check helper ──
+            # Returns True if a newer finalize_turn has spawned a newer
+            # bg thread, meaning this thread should stop immediately.
+            def _is_stale() -> bool:
+                with _bg_tts_generation_lock:
+                    return my_generation != _bg_tts_generation
 
             stream_url = settings.teacher_chat_url.rsplit("/chat", 1)[0] + "/chat_stream"
             payload: Dict[str, Any] = {"message": _ft, "session_id": _sid}
@@ -902,6 +955,11 @@ def finalize_turn(
                     for raw_line in resp.iter_lines(decode_unicode=True):
                         if not raw_line:
                             continue
+                        # If a newer thread has taken over, stop reading
+                        if _is_stale():
+                            logger.info("Stale LLM producer (gen=%d) — aborting stream", my_generation)
+                            resp.close()
+                            return
                         try:
                             msg = _json.loads(raw_line)
                         except _json.JSONDecodeError:
@@ -921,6 +979,8 @@ def finalize_turn(
                     resp.close()
                 except Exception as exc:
                     logger.warning("chat_stream failed, falling back to /chat | error=%s", exc)
+                    if _is_stale():
+                        return
                     result = send_to_teacher(_sid, _ft, _ed, _im)
                     teacher_text = result["text"]
                     if teacher_text:
@@ -929,28 +989,36 @@ def finalize_turn(
                     sentence_queue.put(_SENTINEL)
 
             # ── Sentence iterator: reads from queue until sentinel ──
-            # Uses a timeout on get() so that when stream_and_play tries to
-            # drain remaining sentences after an interruption, it won't block
-            # indefinitely if the LLM producer is still running.
-            _iter_drain_mode = False  # set True by stream_and_play drain
+            _iter_drain_mode = False
 
             class _DrainableSentenceIter:
-                """Wrapper around a queue-backed generator that supports
-                a drain mode with short timeouts for non-blocking drain."""
-
                 def __iter__(self):
                     return self
 
                 def __next__(self):
                     while True:
+                        # Check staleness while waiting for sentences.
+                        # Just raise StopIteration — do NOT call
+                        # _tts_stop_playback() here because sd.stop()
+                        # is global and would kill the NEW thread's
+                        # audio too.  The new finalize_turn already
+                        # called _tts_stop_playback() before spawning
+                        # the new thread.
+                        if _is_stale():
+                            raise StopIteration
                         try:
-                            timeout = 0.3 if _iter_drain_mode else 30
+                            timeout = 0.3 if _iter_drain_mode else 2
                             item = sentence_queue.get(timeout=timeout)
                         except _queue.Empty:
                             if _iter_drain_mode:
                                 raise StopIteration
                             continue
                         if item is _SENTINEL:
+                            raise StopIteration
+                        # One more staleness check after dequeue — if we
+                        # went stale while blocked on the queue, don't
+                        # return this sentence for playback.
+                        if _is_stale():
                             raise StopIteration
                         return item
 
@@ -959,6 +1027,11 @@ def finalize_turn(
                     nonlocal _iter_drain_mode
                     _iter_drain_mode = True
 
+            # ── Check staleness before starting anything ──
+            if _is_stale():
+                logger.info("Stale bg-stream-tts (gen=%d) — exiting before LLM call", my_generation)
+                return
+
             sentence_iter = _DrainableSentenceIter()
 
             # Start LLM producer on a sub-thread
@@ -966,12 +1039,24 @@ def finalize_turn(
             producer.start()
 
             # Play TTS sentence-by-sentence (blocks until all done or interrupted)
-            if _tts_client is not None:
+            if _tts_client is not None and not _is_stale():
                 _tts_client.stream_and_play(
                     sentences=sentence_iter,
                     emotion_payload=_ed,
                     session_id=_sid,
                 )
+
+            # Check if this thread was superseded while playing
+            superseded = _is_stale()
+            if superseded:
+                logger.info(
+                    "Stale bg-stream-tts (gen=%d) — suppressing Teacher: print and memory card",
+                    my_generation,
+                )
+                # Don't print Teacher: or extract memory — a newer thread
+                # is handling the conversation now.
+                producer.join(timeout=1)
+                return
 
             # Check if TTS was interrupted
             tts_interrupted = _tts_client is not None and _tts_client._stop_event.is_set()
