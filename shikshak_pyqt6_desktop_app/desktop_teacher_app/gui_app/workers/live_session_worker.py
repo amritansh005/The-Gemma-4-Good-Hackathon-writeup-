@@ -418,6 +418,7 @@ class LiveSessionWorker(QObject):
                                 if not vcc._tts_is_playing():
                                     self.status_changed.emit("Listening")
                                 self.note_changed.emit("Student speech detected")
+                        replay_finalized = False
                         for buf_frame in buffered:
                             with state.lock:
                                 if not state.turn.speech_active or state.finalizing:
@@ -428,6 +429,58 @@ class LiveSessionWorker(QObject):
                                     is_speech=buf_frame["is_speech"],
                                 )
                                 state.is_speech_flags.append(buf_frame["is_speech"])
+                                decision = turn_manager.evaluate(state.turn)
+
+                            if decision.action == "finalize":
+                                logger.info(
+                                    "Buffered speech finalized during replay | reason=%s | frames=%d",
+                                    decision.reason, len(buffered),
+                                )
+                                self.status_changed.emit("Thinking")
+
+                                # Release any stale capture
+                                if _active_capture is not None:
+                                    _active_capture.release()
+                                    _active_capture = None
+
+                                capture = PrintCapture(self)
+                                capture.__enter__()
+                                _active_capture = capture
+
+                                def _finalize_replay_bg(cap=capture):
+                                    try:
+                                        vcc.finalize_turn(
+                                            state, stt, turn_manager, session_id,
+                                            streamer, ser_model, speaker_verifier,
+                                        )
+                                    except Exception as exc:
+                                        logger.exception("finalize_turn (replay) failed")
+                                        self.error_occurred.emit(str(exc))
+                                    finally:
+                                        self.live_student_text.emit("")
+                                        if not cap.saw_valid_student and not cap.saw_tts_resume:
+                                            cap.done = True
+                                            if not self._stop_requested:
+                                                self.status_changed.emit("Listening")
+
+                                threading.Thread(
+                                    target=_finalize_replay_bg,
+                                    daemon=True,
+                                    name="finalize-replay",
+                                ).start()
+                                replay_finalized = True
+                                break
+                            elif decision.action == "discard":
+                                logger.info(
+                                    "Buffered speech discarded during replay | reason=%s",
+                                    decision.reason,
+                                )
+                                state.reset()
+                                replay_finalized = True
+                                break
+
+                        if not replay_finalized:
+                            vcc.maybe_launch_partial_transcription(state, stt, turn_manager)
 
                     # Interruption handling — runs on EVERY speech_frame,
                     # even while finalize_turn is running in background
@@ -457,12 +510,45 @@ class LiveSessionWorker(QObject):
                     if event.event_type == "speech_start":
                         with state.lock:
                             if state.finalizing:
-                                # Buffer the speech start for replay after
-                                # finalization completes
-                                if not state.pending_speech_active:
-                                    state.pending_speech_active = True
+                                if vcc._tts_is_playing():
+                                    # TTS is active → potential interruption.
+                                    # Buffer for the interruption pipeline.
+                                    if not state.pending_speech_active:
+                                        state.pending_speech_active = True
+                                        state.pending_speech_buffer.clear()
+                                        logger.info("Buffering speech during finalization (TTS playing)")
+                                else:
+                                    # TTS has NOT started → user is speaking
+                                    # during the Thinking phase.  Cancel the
+                                    # old response and start fresh.
+                                    # Preserve buffered frames so early words
+                                    # aren't lost.
+                                    saved_frames = list(state.pending_speech_buffer)
+                                    logger.info(
+                                        "New speech during Thinking phase — cancelling pending response | buffered_frames=%d",
+                                        len(saved_frames),
+                                    )
+                                    vcc.cancel_pending_response()
+                                    state.finalizing = False
                                     state.pending_speech_buffer.clear()
-                                    logger.info("Buffering speech during finalization")
+                                    state.pending_speech_active = False
+                                    state.reset()
+                                    turn_manager.start_turn(state.turn)
+                                    # Replay saved frames into the fresh turn
+                                    for buf in saved_frames:
+                                        turn_manager.append_frame(
+                                            state.turn,
+                                            buf["pcm_bytes"],
+                                            is_speech=buf["is_speech"],
+                                        )
+                                        state.is_speech_flags.append(buf["is_speech"])
+                                    self.status_changed.emit("Listening")
+                                    self.note_changed.emit("Student speech detected (cancelled previous)")
+                                    # Release stale PrintCapture
+                                    if _active_capture is not None:
+                                        _active_capture.release()
+                                        _active_capture = None
+                                        self.live_teacher_text.emit("")
                             elif not state.turn.speech_active:
                                 turn_manager.start_turn(state.turn)
                                 if not vcc._tts_is_playing():
@@ -473,13 +559,49 @@ class LiveSessionWorker(QObject):
                     if event.event_type == "speech_frame" and event.pcm_bytes:
                         with state.lock:
                             if state.finalizing:
-                                # Buffer frames during finalization
-                                if state.pending_speech_active:
-                                    state.pending_speech_buffer.append({
-                                        "pcm_bytes": event.pcm_bytes,
-                                        "is_speech": event.is_speech,
-                                    })
-                                continue
+                                if vcc._tts_is_playing():
+                                    # TTS active → buffer for interruption pipeline
+                                    if state.pending_speech_active:
+                                        state.pending_speech_buffer.append({
+                                            "pcm_bytes": event.pcm_bytes,
+                                            "is_speech": event.is_speech,
+                                        })
+                                    continue
+                                else:
+                                    # TTS not playing → cancel old response,
+                                    # process frame normally.
+                                    # Preserve buffered frames so early words
+                                    # aren't lost.
+                                    if not state.turn.speech_active:
+                                        saved_frames = list(state.pending_speech_buffer)
+                                        logger.info(
+                                            "Speech frame during Thinking phase — cancelling pending response | buffered_frames=%d",
+                                            len(saved_frames),
+                                        )
+                                        vcc.cancel_pending_response()
+                                        state.finalizing = False
+                                        state.pending_speech_buffer.clear()
+                                        state.pending_speech_active = False
+                                        state.reset()
+                                        # Release stale PrintCapture
+                                        if _active_capture is not None:
+                                            _active_capture.release()
+                                            _active_capture = None
+                                            self.live_teacher_text.emit("")
+                                        if event.is_speech:
+                                            turn_manager.start_turn(state.turn)
+                                            # Replay saved frames
+                                            for buf in saved_frames:
+                                                turn_manager.append_frame(
+                                                    state.turn,
+                                                    buf["pcm_bytes"],
+                                                    is_speech=buf["is_speech"],
+                                                )
+                                                state.is_speech_flags.append(buf["is_speech"])
+                                            self.status_changed.emit("Listening")
+                                            self.note_changed.emit("Student speech detected (cancelled previous)")
+                                        else:
+                                            continue
                             if not state.turn.speech_active:
                                 # If VAD says speech is happening but turn
                                 # isn't active, auto-start a turn.  This

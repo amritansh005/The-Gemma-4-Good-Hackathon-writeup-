@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import io
 import logging
 import queue
 import re
 import threading
 import time
-import wave
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -69,7 +67,8 @@ class TTSClient:
         # When playback is stopped by an interruption, we save the
         # remaining audio so it can be resumed if the "interruption"
         # turns out to be noise.
-        self._interrupted_audio: Optional[bytes] = None  # remaining WAV audio
+        self._interrupted_pcm: Optional[np.ndarray] = None  # remaining float32 PCM audio
+        self._interrupted_sr: int = 24000  # sample rate for interrupted audio
         self._interrupted_chunks: Optional[list] = None  # remaining text chunks
         self._interrupted_emotion: Optional[Dict] = None
         self._interrupted_session: Optional[str] = None
@@ -117,7 +116,8 @@ class TTSClient:
         """Discard any saved audio from a previous interruption.
         Called when the interruption was confirmed as real."""
         with self._state_lock:
-            self._interrupted_audio = None
+            self._interrupted_pcm = None
+            self._interrupted_sr = 24000
             self._interrupted_chunks = None
             self._interrupted_emotion = None
             self._interrupted_session = None
@@ -127,20 +127,22 @@ class TTSClient:
     def has_resume_audio(self) -> bool:
         """True if there is saved audio from a false interruption."""
         with self._state_lock:
-            return (self._interrupted_audio is not None
+            return (self._interrupted_pcm is not None
                     or self._interrupted_chunks is not None)
 
     def resume_playback(self) -> None:
         """Resume playback from where a false interruption stopped it.
         Called from voice_chat_client when a turn is discarded as noise."""
         with self._state_lock:
-            remaining_audio = self._interrupted_audio
+            remaining_pcm = self._interrupted_pcm
+            remaining_sr = self._interrupted_sr
             remaining_chunks = self._interrupted_chunks
             emotion = self._interrupted_emotion
             session_id = self._interrupted_session
             full_text = self._interrupted_full_text
             # Clear so we don't resume twice
-            self._interrupted_audio = None
+            self._interrupted_pcm = None
+            self._interrupted_sr = 24000
             self._interrupted_chunks = None
             self._interrupted_emotion = None
             self._interrupted_session = None
@@ -149,18 +151,11 @@ class TTSClient:
             # have reduced it and the restore path may not have run)
             self._volume_scale = 1.0
 
-        if remaining_audio is not None:
+        if remaining_pcm is not None:
             # Estimate remaining audio duration for logging
             audio_duration_ms = 0.0
-            try:
-                buf = io.BytesIO(remaining_audio)
-                with wave.open(buf, "rb") as wf:
-                    n_frames = wf.getnframes()
-                    sample_rate = wf.getframerate()
-                    if sample_rate > 0:
-                        audio_duration_ms = (n_frames / sample_rate) * 1000.0
-            except Exception:
-                pass
+            if remaining_sr > 0:
+                audio_duration_ms = (len(remaining_pcm) / remaining_sr) * 1000.0
 
             logger.info(
                 "TTS resuming playback from interrupted audio | duration=%.0fms | remaining_chunks=%d",
@@ -180,7 +175,7 @@ class TTSClient:
             self._set_playback_state(True, full_text)
             try:
                 if audio_duration_ms >= 150.0:
-                    self._play_wav_bytes_streaming(remaining_audio)
+                    self._play_pcm_streaming(remaining_pcm, remaining_sr)
                 # If there are also remaining chunks, continue with those
                 if remaining_chunks:
                     # Check if playback was re-interrupted during the audio resume
@@ -245,17 +240,20 @@ class TTSClient:
                         payload["session_id"] = session_id
 
                     resp = requests.post(
-                        f"{self._url}/synthesize",
+                        f"{self._url}/synthesize/pcm",
                         json=payload,
                         timeout=self._timeout,
                     )
                     resp.raise_for_status()
 
+                    sample_rate = int(resp.headers.get("X-TTS-Sample-Rate", "24000"))
+                    audio = np.frombuffer(resp.content, dtype=np.int16).astype(np.float32) / 32767.0
+
                     if not playback_entered:
                         self._set_playback_state(True, full_text)
                         playback_entered = True
 
-                    self._play_wav_bytes_streaming(resp.content)
+                    self._play_pcm_streaming(audio, sample_rate)
                     self._available = True
 
                 except Exception as exc:
@@ -458,7 +456,7 @@ class TTSClient:
                         payload["session_id"] = session_id
 
                     resp = requests.post(
-                        f"{self._url}/synthesize",
+                        f"{self._url}/synthesize/pcm",
                         json=payload,
                         timeout=self._timeout,
                     )
@@ -467,10 +465,14 @@ class TTSClient:
                     latency = resp.headers.get("X-TTS-Latency-Ms", "?")
                     state = resp.headers.get("X-TTS-Resolved-State", "?")
                     cache_hit = resp.headers.get("X-TTS-Cache-Hit", "false") == "true"
+                    sample_rate = int(resp.headers.get("X-TTS-Sample-Rate", "24000"))
                     logger.info(
                         "TTS | chunk=%d/%d | latency=%sms | state=%s | cache=%s | chars=%d",
                         idx + 1, len(chunks), latency, state, cache_hit, len(chunk_text),
                     )
+
+                    # Decode raw PCM int16 → float32 for playback
+                    audio = np.frombuffer(resp.content, dtype=np.int16).astype(np.float32) / 32767.0
 
                     # On the FIRST chunk, enter playback state right before
                     # playing audio — NOT before the HTTP request.
@@ -484,8 +486,8 @@ class TTSClient:
                         playback_entered = True
 
                     # Play this chunk's audio (checks _stop_event per audio block,
-                    # saves remaining audio to _interrupted_audio if stopped)
-                    self._play_wav_bytes_streaming(resp.content)
+                    # saves remaining audio to _interrupted_pcm if stopped)
+                    self._play_pcm_streaming(audio, sample_rate)
 
                     # If playback was stopped mid-chunk, save remaining chunks too
                     with self._state_lock:
@@ -625,7 +627,7 @@ class TTSClient:
                         payload["session_id"] = session_id
 
                     resp = requests.post(
-                        f"{self._url}/synthesize",
+                        f"{self._url}/synthesize/pcm",
                         json=payload,
                         timeout=self._timeout,
                     )
@@ -634,10 +636,14 @@ class TTSClient:
                     latency = resp.headers.get("X-TTS-Latency-Ms", "?")
                     state_hdr = resp.headers.get("X-TTS-Resolved-State", "?")
                     cache_hit = resp.headers.get("X-TTS-Cache-Hit", "false") == "true"
+                    sample_rate = int(resp.headers.get("X-TTS-Sample-Rate", "24000"))
                     logger.info(
                         "TTS stream | sentence=%d | latency=%sms | state=%s | cache=%s | chars=%d",
                         sentence_count, latency, state_hdr, cache_hit, len(sentence),
                     )
+
+                    # Decode raw PCM int16 → float32 for playback
+                    audio = np.frombuffer(resp.content, dtype=np.int16).astype(np.float32) / 32767.0
 
                     if not playback_entered:
                         self._set_playback_state(True, accumulated_text)
@@ -648,12 +654,12 @@ class TTSClient:
                             self._interrupted_session = session_id
                         playback_entered = True
 
-                    self._play_wav_bytes_streaming(resp.content)
+                    self._play_pcm_streaming(audio, sample_rate)
 
                     # Check if interrupted during playback of this chunk
                     with self._state_lock:
                         if self._stop_event.is_set():
-                            # _play_wav_bytes_streaming already saved _interrupted_audio.
+                            # _play_pcm_streaming already saved _interrupted_pcm.
                             # Now drain and save remaining sentences from iterator.
                             remaining = self._drain_remaining_sentences(sentences)
                             if remaining:
@@ -680,31 +686,25 @@ class TTSClient:
             if playback_entered:
                 self._set_playback_state(False, "")
 
-    def _play_wav_bytes_streaming(self, wav_bytes: bytes) -> None:
+    def _play_pcm_streaming(self, audio: 'np.ndarray', sample_rate: int) -> None:
+        """Play a float32 numpy audio array through sounddevice.
+
+        Supports interruption (saves remaining audio to _interrupted_pcm)
+        and volume ducking.  No WAV encoding/decoding anywhere.
+
+        Args:
+            audio: float32 numpy array, mono, values in [-1.0, 1.0]
+            sample_rate: sample rate in Hz (e.g. 24000)
+        """
         if not _SD_AVAILABLE:
             logger.debug("sounddevice not available — audio not played")
             return
 
         try:
-            buf = io.BytesIO(wav_bytes)
-            with wave.open(buf, "rb") as wf:
-                sample_rate = wf.getframerate()
-                n_channels = wf.getnchannels()
-                sampwidth = wf.getsampwidth()
-                n_frames = wf.getnframes()
-                frames = wf.readframes(n_frames)
-
-            if sampwidth != 2:
-                raise ValueError(f"Unsupported WAV sample width: {sampwidth}")
-
-            audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32767.0
-            if n_channels == 2:
-                audio = audio.reshape(-1, 2)
-
             chunk_size = 2048
             stream = sd.OutputStream(
                 samplerate=sample_rate,
-                channels=n_channels,
+                channels=1,
                 dtype="float32",
                 blocksize=chunk_size,
             )
@@ -719,14 +719,8 @@ class TTSClient:
                             # Save remaining audio for possible resume
                             remaining = audio[idx:]
                             if len(remaining) > 0:
-                                remaining_int16 = (remaining * 32767.0).astype(np.int16)
-                                remaining_buf = io.BytesIO()
-                                with wave.open(remaining_buf, "wb") as wf_out:
-                                    wf_out.setnchannels(n_channels)
-                                    wf_out.setsampwidth(2)
-                                    wf_out.setframerate(sample_rate)
-                                    wf_out.writeframes(remaining_int16.tobytes())
-                                self._interrupted_audio = remaining_buf.getvalue()
+                                self._interrupted_pcm = remaining
+                                self._interrupted_sr = sample_rate
                             logger.info("TTS playback stopped early by interruption")
                             break
                         volume = self._volume_scale

@@ -28,7 +28,7 @@ class Settings:
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     cache_enabled: bool = os.getenv("TTS_CACHE_ENABLED", "true").lower() == "true"
     cache_ttl_seconds: int = int(os.getenv("TTS_CACHE_TTL_SECONDS", "3600"))
-    cache_max_text_chars: int = int(os.getenv("TTS_CACHE_MAX_TEXT_CHARS", "200"))
+    cache_max_text_chars: int = int(os.getenv("TTS_CACHE_MAX_TEXT_CHARS", "2000"))
 
     # ── Service ─────────────────────────────────────────────────────
     host: str = os.getenv("TTS_HOST", "0.0.0.0")

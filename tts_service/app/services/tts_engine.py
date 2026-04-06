@@ -360,6 +360,21 @@ class TTSEngine:
         audio, sr = self.synthesize(text, prosody, voice)
         return _audio_to_wav_bytes(audio, sr)
 
+    def pcm_bytes(
+        self,
+        text: str,
+        prosody: ResolvedProsody,
+        voice: Optional[str] = None,
+    ) -> tuple[bytes, int]:
+        """Synthesize and return raw int16 PCM bytes (no WAV header).
+
+        Returns (pcm_data, sample_rate) — lighter than wav_bytes() because
+        it skips WAV container encoding entirely.
+        """
+        audio, sr = self.synthesize(text, prosody, voice)
+        pcm = _float32_to_int16(audio)
+        return pcm.tobytes(), sr
+
     @property
     def backend(self) -> str:
         return self._backend
@@ -370,14 +385,8 @@ class TTSEngine:
 
     # ── Backend implementations ───────────────────────────────────────────────
 
-    def _synthesize_openvoice(
-        self,
-        text: str,
-        prosody: ResolvedProsody,
-        voice: str,
-    ) -> np.ndarray:
-        # OpenVoice's lightweight base TTS stack exposes speaker IDs via
-        # MeloTTS' hps.data.spk2id map.
+    def _resolve_speaker_id(self, voice: str) -> int:
+        """Resolve a voice name to a MeloTTS speaker ID."""
         speaker_map = getattr(getattr(self._model, "hps", None), "data", None)
         spk2id = getattr(speaker_map, "spk2id", {}) if speaker_map is not None else {}
         if not isinstance(spk2id, dict):
@@ -391,14 +400,104 @@ class TTSEngine:
         }
         desired = _VOICE_MAP.get(voice, voice)
         if desired in spk2id:
-            speaker_id = spk2id[desired]
+            return spk2id[desired]
         elif spk2id:
-            # Best-effort fallback to first available speaker
-            speaker_id = next(iter(spk2id.values()))
+            return next(iter(spk2id.values()))
         else:
-            # Some MeloTTS builds don't expose spk2id for single-speaker EN.
-            # Use canonical default speaker id.
-            speaker_id = 0
+            return 0
+
+    def _synthesize_openvoice(
+        self,
+        text: str,
+        prosody: ResolvedProsody,
+        voice: str,
+    ) -> np.ndarray:
+        speaker_id = self._resolve_speaker_id(voice)
+
+        # ── In-memory synthesis: intercept the file write ──────────────
+        # MeloTTS tts_to_file() internally generates audio as a numpy/torch
+        # array, then writes it to disk via soundfile.write() or
+        # scipy.io.wavfile.write().  We monkey-patch the write function to
+        # capture the audio array directly, avoiding all disk I/O.
+        _captured_audio = {}
+
+        def _intercept_sf_write(file, data, samplerate, **kwargs):
+            """Intercept soundfile.write — capture audio in memory."""
+            _captured_audio["data"] = np.asarray(data, dtype=np.float32)
+            _captured_audio["sr"] = samplerate
+
+        def _intercept_scipy_write(filename, rate, data):
+            """Intercept scipy.io.wavfile.write — capture audio in memory."""
+            audio = np.asarray(data, dtype=np.float32)
+            # scipy wavfile uses int16 range — normalize to float32 [-1, 1]
+            if audio.dtype == np.int16 or np.abs(audio).max() > 2.0:
+                audio = audio.astype(np.float32) / 32767.0
+            _captured_audio["data"] = audio
+            _captured_audio["sr"] = rate
+
+        # Patch soundfile.write if available
+        _sf_patched = False
+        _scipy_patched = False
+        _orig_sf_write = None
+        _orig_scipy_write = None
+
+        if _SF_AVAILABLE:
+            _orig_sf_write = sf.write
+            sf.write = _intercept_sf_write
+            _sf_patched = True
+
+        try:
+            import scipy.io.wavfile as _scipy_wav
+            _orig_scipy_write = _scipy_wav.write
+            _scipy_wav.write = _intercept_scipy_write
+            _scipy_patched = True
+        except ImportError:
+            pass
+
+        try:
+            self._model.tts_to_file(
+                text=text,
+                speaker_id=speaker_id,
+                output_path="/dev/null",  # never actually written
+                speed=prosody.rate_multiplier,
+            )
+        finally:
+            # Restore original write functions immediately
+            if _sf_patched:
+                sf.write = _orig_sf_write
+            if _scipy_patched:
+                import scipy.io.wavfile as _scipy_wav
+                _scipy_wav.write = _orig_scipy_write
+
+        if "data" not in _captured_audio:
+            # Fallback: if interception failed (e.g. MeloTTS uses a
+            # different write path), fall back to temp-file approach.
+            logger.warning("In-memory interception missed — falling back to temp file")
+            return self._synthesize_openvoice_file_fallback(text, prosody, voice)
+
+        audio = _captured_audio["data"]
+        sr = _captured_audio["sr"]
+
+        if isinstance(audio, np.ndarray) and audio.ndim > 1:
+            audio = audio.mean(axis=1)
+
+        if int(sr) != self._sample_rate and _LIBROSA_AVAILABLE:
+            audio = librosa.resample(audio, orig_sr=int(sr), target_sr=self._sample_rate)
+
+        audio = np.asarray(audio, dtype=np.float32).squeeze()
+        peak = np.abs(audio).max()
+        if peak > 0:
+            audio = audio / peak
+        return audio
+
+    def _synthesize_openvoice_file_fallback(
+        self,
+        text: str,
+        prosody: ResolvedProsody,
+        voice: str,
+    ) -> np.ndarray:
+        """Fallback: write to temp file and read back (original behavior)."""
+        speaker_id = self._resolve_speaker_id(voice)
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             out_path = tmp.name

@@ -231,6 +231,14 @@ class MicrophoneVADStreamer:
         continuous_speech_frames = 0
         pre_roll: Deque[bytes] = deque(maxlen=self.pre_roll_frames)
 
+        # ── Idle tick: yield a lightweight event periodically during
+        # silence so the main event loop can run housekeeping (buffer
+        # replay, streamer reset checks, TTS state tracking).
+        # Without this, the generator blocks indefinitely during silence
+        # and the event loop is stuck.
+        _idle_tick_interval = max(3, 100 // self.frame_ms)  # ~100ms
+        _idle_frame_counter = 0
+
         def callback(indata, frames, time, status) -> None:  # noqa: ANN001
             if status:
                 logger.debug("Sounddevice status: %s", status)
@@ -289,9 +297,11 @@ class MicrophoneVADStreamer:
                     pre_roll.append(frame)
                     if is_speech:
                         voiced_run += 1
+                        _idle_frame_counter = 0
                         if voiced_run >= self.start_trigger_frames:
                             speech_started = True
                             speech_frame_count = 0
+                            _idle_frame_counter = 0
                             logger.info("Speech start detected")
                             yield AudioEvent(event_type="speech_start")
                             for buffered_frame in pre_roll:
@@ -305,6 +315,12 @@ class MicrophoneVADStreamer:
                             pre_roll.clear()
                     else:
                         voiced_run = 0
+                        # ── Idle tick: yield periodically so the event
+                        # loop can run housekeeping during silence ──
+                        _idle_frame_counter += 1
+                        if _idle_frame_counter >= _idle_tick_interval:
+                            _idle_frame_counter = 0
+                            yield AudioEvent(event_type="idle_tick")
                     continue
 
                 speech_frame_count += 1

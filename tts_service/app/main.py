@@ -283,6 +283,101 @@ def synthesize(req: SynthesizeRequest) -> Response:
         raise HTTPException(status_code=500, detail=f"TTS synthesis failed: {exc}")
 
 
+@app.post("/synthesize/pcm", response_class=Response)
+def synthesize_pcm(req: SynthesizeRequest) -> Response:
+    """
+    Raw PCM synthesis — no WAV container overhead.
+
+    Returns: raw int16 PCM bytes (mono)
+    Content-Type: audio/pcm
+    Headers:
+      X-TTS-Sample-Rate      : sample rate (e.g. 24000)
+      X-TTS-Channels         : 1 (always mono)
+      X-TTS-Sample-Width     : 2 (int16)
+      X-TTS-Latency-Ms       : synthesis latency
+      X-TTS-Cache-Hit        : true | false
+      X-TTS-Resolved-State   : emotion state used
+      X-TTS-Backend          : model backend name
+
+    The client uses the headers to configure sounddevice playback
+    directly from the raw bytes — no WAV parsing needed.
+    """
+    engine = _get_engine()
+    _metrics.record_request_start()
+    t0 = time.monotonic()
+    cache_hit = False
+
+    voice = req.voice or settings.default_voice
+    prosody = _resolve_emotion(req.emotion)
+
+    logger.info(
+        "TTS synthesize/pcm | session=%s | chars=%d | state=%s | trend=%s | rate=%.2f | voice=%s",
+        req.session_id or "-",
+        len(req.text),
+        prosody.resolved_state,
+        prosody.resolved_trend,
+        prosody.rate_multiplier,
+        voice,
+    )
+
+    try:
+        # Cache check (PCM cache uses a separate prefix to avoid
+        # mixing with WAV cache entries)
+        cache_key = "pcm:" + make_cache_key(req.text, prosody.resolved_state, prosody.resolved_trend, voice)
+        if req.use_cache and _cache:
+            cached = _cache.get(cache_key)
+            if cached:
+                cache_hit = True
+                latency_ms = (time.monotonic() - t0) * 1000
+                _metrics.record_request_end(latency_ms, cache_hit=True)
+                return Response(
+                    content=cached,
+                    media_type="audio/pcm",
+                    headers={
+                        "X-TTS-Sample-Rate": str(engine.sample_rate),
+                        "X-TTS-Channels": "1",
+                        "X-TTS-Sample-Width": "2",
+                        "X-TTS-Latency-Ms": str(round(latency_ms, 1)),
+                        "X-TTS-Cache-Hit": "true",
+                        "X-TTS-Resolved-State": prosody.resolved_state,
+                        "X-TTS-Backend": engine.backend,
+                    },
+                )
+
+        pcm_data, sr = engine.pcm_bytes(req.text, prosody, voice)
+        latency_ms = (time.monotonic() - t0) * 1000
+
+        # Store in cache
+        if req.use_cache and _cache:
+            _cache.set(cache_key, pcm_data, req.text)
+
+        logger.info(
+            "TTS pcm synthesis complete | latency=%.0fms | bytes=%d | state=%s | backend=%s",
+            latency_ms, len(pcm_data), prosody.resolved_state, engine.backend,
+        )
+        _metrics.record_request_end(latency_ms)
+
+        return Response(
+            content=pcm_data,
+            media_type="audio/pcm",
+            headers={
+                "X-TTS-Sample-Rate": str(sr),
+                "X-TTS-Channels": "1",
+                "X-TTS-Sample-Width": "2",
+                "X-TTS-Latency-Ms": str(round(latency_ms, 1)),
+                "X-TTS-Cache-Hit": "false",
+                "X-TTS-Resolved-State": prosody.resolved_state,
+                "X-TTS-Backend": engine.backend,
+            },
+        )
+
+    except Exception as exc:
+        latency_ms = (time.monotonic() - t0) * 1000
+        _metrics.record_request_end(latency_ms, error=True)
+        logger.exception("TTS PCM synthesis failed | session=%s | error=%s", req.session_id, exc)
+        raise HTTPException(status_code=500, detail=f"TTS PCM synthesis failed: {exc}")
+
+
 @app.post("/synthesize/stream")
 async def synthesize_stream(req: SynthesizeRequest) -> StreamingResponse:
     """

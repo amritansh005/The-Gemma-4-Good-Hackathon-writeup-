@@ -2,11 +2,12 @@
 Redis-backed audio cache for TTS responses.
 
 Cache key: SHA-256(text + state + trend + voice)[:24]
-Cache value: raw WAV bytes
+Cache value: raw audio bytes (WAV or PCM depending on endpoint)
 
 Caching is skipped for:
-  - Text longer than settings.cache_max_text_chars (long responses change often)
-  - Any text that contains dynamic placeholders like student names mid-sentence
+  - Text longer than settings.cache_max_text_chars (default 2000, covers
+    all chunk sizes from both stream_and_play sentence-level and
+    _synthesize_and_play's 1800-char merged chunks)
 
 The cache is a best-effort layer — misses are fine, the TTS engine runs anyway.
 """
@@ -25,7 +26,7 @@ except ImportError:
 
 
 class AudioCache:
-    """Redis-backed WAV audio cache."""
+    """Redis-backed audio cache (format-agnostic: WAV or PCM bytes)."""
 
     def __init__(self, redis_url: str, ttl_seconds: int, max_text_chars: int, enabled: bool) -> None:
         self._enabled = enabled and _REDIS_AVAILABLE
@@ -37,7 +38,7 @@ class AudioCache:
             try:
                 self._client = redis_lib.from_url(redis_url, decode_responses=False)
                 self._client.ping()
-                logger.info("AudioCache connected | redis=%s | ttl=%ds", redis_url, ttl_seconds)
+                logger.info("AudioCache connected | redis=%s | ttl=%ds | max_chars=%d", redis_url, ttl_seconds, max_text_chars)
             except Exception as exc:
                 logger.warning("AudioCache Redis connection failed | error=%s | caching disabled", exc)
                 self._enabled = False
@@ -54,14 +55,14 @@ class AudioCache:
             logger.debug("AudioCache get error | key=%s | error=%s", key, exc)
             return None
 
-    def set(self, key: str, wav_bytes: bytes, text: str) -> None:
+    def set(self, key: str, audio_bytes: bytes, text: str) -> None:
         if not self._enabled or self._client is None:
             return
         if len(text) > self._max_chars:
             return
         try:
-            self._client.setex(key, self._ttl, wav_bytes)
-            logger.debug("AudioCache SET | key=%s | bytes=%d | ttl=%ds", key, len(wav_bytes), self._ttl)
+            self._client.setex(key, self._ttl, audio_bytes)
+            logger.debug("AudioCache SET | key=%s | bytes=%d | ttl=%ds", key, len(audio_bytes), self._ttl)
         except Exception as exc:
             logger.debug("AudioCache set error | key=%s | error=%s", key, exc)
 

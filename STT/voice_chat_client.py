@@ -96,6 +96,16 @@ BACKCHANNEL_WORDS = {
 INTERRUPT_BACKCHANNEL_OVERRIDE_MS = 800
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Echo-aware ASR retry: when partial ASR returns text that is 100% TTS echo
+# (every word matches the TTS output), don't count it as a real ASR failure.
+# Instead, schedule a retry after more audio accumulates so the user's voice
+# has more weight relative to the echo.  This solves the "first turn"
+# interruption bug without false-positive risk from noise.
+# ─────────────────────────────────────────────────────────────────────────────
+ECHO_RETRY_EXTRA_MS = 400          # wait this much more audio before retrying
+ECHO_RETRY_MAX_ATTEMPTS = 3       # max echo-retries per interruption candidate
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Normal (non-TTS) interruption thresholds
 # ─────────────────────────────────────────────────────────────────────────────
 INTERRUPT_MIN_SPEECH_MS = 180
@@ -143,6 +153,32 @@ def _is_only_backchannel(text: str) -> bool:
 
     words = normalized.split()
     return all(w in BACKCHANNEL_WORDS for w in words)
+
+
+def _filter_tts_echo(asr_text: str, tts_text: str) -> str:
+    """Remove words from *asr_text* that are likely TTS echo.
+
+    When the user speaks during TTS playback, the microphone picks up
+    both the user's voice and TTS audio from the speakers.  Whisper
+    often transcribes the TTS audio instead of (or mixed with) the
+    user's actual speech.
+
+    Strategy: tokenize both texts, remove any word from the ASR result
+    that appears in the TTS text.  What remains is likely the user's
+    actual speech.  This is intentionally aggressive — it's better to
+    strip too much and fall through to the VAD-duration fallback than
+    to let TTS echo block a real interruption.
+    """
+    if not tts_text or not asr_text:
+        return asr_text
+
+    tts_words = set(_normalize_text(tts_text).split())
+    if not tts_words:
+        return asr_text
+
+    asr_words = _normalize_text(asr_text).split()
+    filtered = [w for w in asr_words if w not in tts_words]
+    return " ".join(filtered)
 
 
 def _tts_is_playing() -> bool:
@@ -255,6 +291,25 @@ def _tts_clear_resume_state() -> None:
         logger.exception("Failed to clear TTS resume state")
 
 
+def cancel_pending_response() -> None:
+    """Cancel any in-flight LLM streaming / TTS from a previous turn.
+
+    This bumps _bg_tts_generation so the stale bg thread's _is_stale()
+    returns True and it exits silently.  Also stops any TTS that might
+    have just started and clears resume state.
+
+    Called when the user starts speaking during the 'Thinking' phase
+    (after their previous turn was finalized but before TTS begins).
+    This is NOT an interruption — TTS hasn't started playing yet.
+    """
+    global _bg_tts_generation
+    with _bg_tts_generation_lock:
+        _bg_tts_generation += 1
+    _tts_stop_playback()
+    _tts_clear_resume_state()
+    logger.info("Cancelled pending response — user spoke before TTS started")
+
+
 class InterruptionState:
     """
     Tracks user barge-in while assistant TTS is active.
@@ -274,6 +329,10 @@ class InterruptionState:
         self.vad_asr_delegated: bool = False
         self.candidate_id: int = 0
         self._retry_requested: bool = False
+        # Echo-retry tracking: when ASR returns 100% TTS echo,
+        # schedule a retry after more audio accumulates.
+        self.echo_retry_count: int = 0
+        self.echo_retry_after_ms: float = 0.0  # retry when speech_ms exceeds this
 
     def reset(self) -> None:
         self.active = False
@@ -288,6 +347,8 @@ class InterruptionState:
         self.partial_confirm_in_flight = False
         self.vad_asr_delegated = False
         self._retry_requested = False
+        self.echo_retry_count = 0
+        self.echo_retry_after_ms = 0.0
         # NOTE: candidate_id intentionally NOT reset — it only increments
 
     def begin_candidate(self, tts_text: str) -> None:
@@ -303,6 +364,8 @@ class InterruptionState:
         self.partial_confirm_in_flight = False
         self.vad_asr_delegated = False
         self._retry_requested = False
+        self.echo_retry_count = 0
+        self.echo_retry_after_ms = 0.0
         self.candidate_id += 1
 
 
@@ -480,13 +543,69 @@ def _run_partial_interrupt_confirmation(
                 )
                 return
 
+            # ── Echo filtering: strip words that match TTS output ──
+            original_text = text
+            filtered_text = _filter_tts_echo(text, tts_text_snapshot)
+
+            if filtered_text != original_text:
+                logger.info(
+                    "TTS echo filtered | raw=%r | filtered=%r | tts=%r",
+                    original_text, filtered_text, tts_text_snapshot[:80],
+                )
+
+            # Try confirmation from filtered text first, then original
             reason: Optional[str] = None
-            if _contains_interruption_keyword(text):
-                reason = f"keyword:{text}"
-            elif len(text.split()) >= 2:
-                reason = f"partial_asr:{text}"
+            check_text = filtered_text if filtered_text.strip() else text
+
+            if _contains_interruption_keyword(check_text):
+                reason = f"keyword:{check_text}"
+            elif len(check_text.split()) >= 2:
+                reason = f"partial_asr:{check_text}"
+
+            if not reason and filtered_text.strip() != text:
+                if _contains_interruption_keyword(text):
+                    reason = f"keyword:{text}"
+                elif len(text.split()) >= 2:
+                    reason = f"partial_asr:{text}"
 
             if not reason:
+                # ── Echo-retry: ASR failed, check if it was pure echo ──
+                # If filtered text is empty (every word matched TTS output),
+                # this is TTS echo, not a real ASR failure.  Schedule a
+                # retry after more audio accumulates so the user's voice
+                # has more weight in the next attempt.
+                is_pure_echo = (
+                    not filtered_text.strip()
+                    and len(original_text.split()) >= 1
+                )
+
+                with state.lock:
+                    current_speech_ms = state.interruption.candidate_speech_ms
+                    retry_count = state.interruption.echo_retry_count
+
+                if is_pure_echo and retry_count < ECHO_RETRY_MAX_ATTEMPTS:
+                    next_retry_at = current_speech_ms + ECHO_RETRY_EXTRA_MS
+                    with state.lock:
+                        state.interruption.echo_retry_count += 1
+                        state.interruption.echo_retry_after_ms = next_retry_at
+                        # Reset vad_asr_delegated so Stage 3 can re-trigger
+                        # once speech_ms exceeds echo_retry_after_ms
+                        state.interruption.vad_asr_delegated = False
+                    logger.info(
+                        "Pure TTS echo detected — scheduling retry #%d | text=%r | "
+                        "current_ms=%.0f | retry_after_ms=%.0f",
+                        retry_count + 1, original_text,
+                        current_speech_ms, next_retry_at,
+                    )
+                else:
+                    logger.info(
+                        "Partial ASR no confirmation reason | text=%r | filtered=%r | "
+                        "speech_ms=%.1f | words=%d | echo_retries=%d",
+                        text, filtered_text,
+                        current_speech_ms,
+                        len(check_text.split()),
+                        retry_count,
+                    )
                 return
 
             with state.lock:
@@ -494,15 +613,9 @@ def _run_partial_interrupt_confirmation(
                     return
                 if state.interruption.confirmed:
                     return
-                # If a NEW interruption candidate started after the silence
-                # reset cleared ours, don't confirm with stale audio.
                 if state.interruption.candidate_id != candidate_id:
                     return
 
-                # Re-activate interruption if it was reset by the silence
-                # timer while we were transcribing.  The generation and
-                # candidate_id checks guarantee this audio belongs to the
-                # correct interruption attempt.
                 state.interruption.active = True
                 state.interruption.confirmed = True
                 state.interruption.reason = reason
@@ -514,11 +627,6 @@ def _run_partial_interrupt_confirmation(
                         state.interruption.candidate_speech_ms, 1
                     ),
                 }
-
-                # NOTE: We do NOT save pending_interruption_prefix.
-                # During TTS the mic picks up speaker audio, so partial
-                # ASR text is contaminated.  The user's speech will be
-                # captured cleanly as a new turn after TTS stops.
 
             logger.info("Interruption confirmed via partial ASR | reason=%s", reason)
             _tts_stop_playback()
@@ -532,12 +640,6 @@ def _run_partial_interrupt_confirmation(
                 state.interruption.partial_confirm_in_flight = False
                 if not state.interruption.confirmed:
                     state.interruption.vad_asr_delegated = False
-                    # ── Retry with more audio if requested ──
-                    # While this worker was running, more speech frames
-                    # accumulated.  If a retry was requested (another
-                    # call to _run_partial_interrupt_confirmation came
-                    # in while we were busy), launch a new attempt now
-                    # with the updated, longer audio.
                     should_retry = (
                         state.interruption.active
                         and not state.interruption.confirmed
@@ -681,6 +783,31 @@ def maybe_handle_tts_interruption(
             )
         return
 
+    # ── Stage 4: echo-retry trigger ──────────────────────────────────
+    # When a previous partial ASR attempt detected pure TTS echo, it
+    # set echo_retry_after_ms.  Once enough new audio has accumulated
+    # (user's voice now has more weight), re-run ASR.  This avoids the
+    # false-positive risk of a hard VAD-only fallback while still
+    # solving the first-turn echo problem.
+    if effective_is_speech and not confirmed:
+        with state.lock:
+            echo_retry_target = state.interruption.echo_retry_after_ms
+            asr_in_flight = state.interruption.partial_confirm_in_flight
+        if (
+            echo_retry_target > 0
+            and candidate_ms >= echo_retry_target
+            and not asr_in_flight
+        ):
+            logger.info(
+                "Echo-retry triggered | speech_ms=%.1f | target_ms=%.1f | retry=#%d",
+                candidate_ms, echo_retry_target,
+                state.interruption.echo_retry_count,
+            )
+            with state.lock:
+                state.interruption.echo_retry_after_ms = 0.0
+                state.interruption.vad_asr_delegated = True
+            _run_partial_interrupt_confirmation(state, stt, 0.0)
+
 
 def finalize_turn(
     state: LiveTranscriptState,
@@ -695,6 +822,28 @@ def finalize_turn(
         if state.finalizing:
             return
         state.finalizing = True
+
+        # ── Prepend early speech frames that were buffered during the
+        # previous finalization.  These frames arrived before the
+        # interruption pipeline's begin_candidate() cleared
+        # state.turn.frames, so they contain the beginning of the
+        # user's sentence (e.g. "I would like to study" before
+        # "physics today").  Prepending them here gives Whisper the
+        # full sentence without changing the interruption pipeline.
+        if state.pending_speech_buffer and state.pending_speech_active:
+            early_frames = [buf["pcm_bytes"] for buf in state.pending_speech_buffer]
+            early_is_speech = [buf["is_speech"] for buf in state.pending_speech_buffer]
+            early_duration = len(early_frames) * settings.audio_frame_ms / 1000.0
+            state.turn.frames = early_frames + list(state.turn.frames)
+            state.turn.total_audio_seconds += early_duration
+            state.is_speech_flags = early_is_speech + list(state.is_speech_flags)
+            logger.info(
+                "Prepended %d early speech frames (%.1fs) to turn audio",
+                len(early_frames), early_duration,
+            )
+            state.pending_speech_buffer.clear()
+            state.pending_speech_active = False
+
         audio_bytes = state.turn.snapshot_audio()
         final_duration = state.turn.total_audio_seconds
         generation = state.turn_generation
@@ -1104,16 +1253,14 @@ def finalize_turn(
             return
         _tts_restore_playback()
         with state.lock:
-            # NOTE: We intentionally do NOT set needs_streamer_reset here.
-            # Resetting the streamer after finalize_turn kills any speech
-            # the user started while finalization was running (the
-            # beginning of their sentence is lost).  The VAD naturally
-            # settles to idle after silence, and the turn manager handles
-            # end-of-turn detection via silence thresholds.
-            # needs_streamer_reset is only set by _prepare_for_tts_resume
-            # (false interruption recovery) where a clean slate is needed.
-            if state.finalizing:
-                pass  # will be cleared by state.reset() below
+            # If the main event loop already cancelled this finalization
+            # (user spoke during Thinking phase) and started a new turn,
+            # state.finalizing will already be False and a new turn may
+            # be active.  Do NOT reset — it would destroy the new turn.
+            if not state.finalizing:
+                # Already cancelled/reset by the main loop — skip.
+                logger.info("finalize_turn finally: skipping reset — already cancelled by main loop")
+                return
         state.reset()
 
 
@@ -1204,6 +1351,7 @@ def main() -> None:
                     if not state.turn.speech_active and not state.finalizing:
                         turn_manager.start_turn(state.turn)
                         print("\nListening...", flush=True)
+                replay_finalized = False
                 for buf_frame in buffered:
                     with state.lock:
                         if not state.turn.speech_active or state.finalizing:
@@ -1214,6 +1362,28 @@ def main() -> None:
                             is_speech=buf_frame["is_speech"],
                         )
                         state.is_speech_flags.append(buf_frame["is_speech"])
+                        decision = turn_manager.evaluate(state.turn)
+
+                    # Check if the replayed frames already form a complete turn
+                    if decision.action == "finalize":
+                        logger.info(
+                            "Buffered speech finalized during replay | reason=%s | frames=%d",
+                            decision.reason, len(buffered),
+                        )
+                        finalize_turn(state, stt, turn_manager, session_id, streamer, ser_model, speaker_verifier)
+                        replay_finalized = True
+                        break
+                    elif decision.action == "discard":
+                        logger.info("Buffered speech discarded during replay | reason=%s", decision.reason)
+                        state.reset()
+                        replay_finalized = True
+                        break
+
+                # If replay didn't finalize, also launch partial
+                # transcription so evaluate() has text context for the
+                # silence frames that will follow.
+                if not replay_finalized:
+                    maybe_launch_partial_transcription(state, stt, turn_manager)
 
             if event.event_type == "speech_frame":
                 maybe_handle_tts_interruption(
@@ -1226,10 +1396,43 @@ def main() -> None:
             if event.event_type == "speech_start":
                 with state.lock:
                     if state.finalizing:
-                        if not state.pending_speech_active:
-                            state.pending_speech_active = True
+                        if _tts_is_playing():
+                            # TTS is active → this is a potential interruption.
+                            # Buffer speech so the interruption pipeline can
+                            # handle it (existing behaviour, unchanged).
+                            if not state.pending_speech_active:
+                                state.pending_speech_active = True
+                                state.pending_speech_buffer.clear()
+                                logger.info("Buffering speech during finalization (TTS playing)")
+                        else:
+                            # TTS has NOT started → user is speaking during
+                            # the Thinking phase.  Cancel the old response
+                            # and start a fresh turn immediately.
+                            # Preserve any already-buffered frames so the
+                            # beginning of the sentence isn't lost.
+                            saved_frames = list(state.pending_speech_buffer)
+                            logger.info(
+                                "New speech during Thinking phase — cancelling pending response | buffered_frames=%d",
+                                len(saved_frames),
+                            )
+                            cancel_pending_response()
+                            # Force-clear finalizing so state.reset() works
+                            state.finalizing = False
                             state.pending_speech_buffer.clear()
-                            logger.info("Buffering speech during finalization")
+                            state.pending_speech_active = False
+                            state.reset()
+                            turn_manager.start_turn(state.turn)
+                            # Replay saved frames into the fresh turn so
+                            # early words aren't lost (same approach as the
+                            # interruption pipeline's direct frame capture).
+                            for buf in saved_frames:
+                                turn_manager.append_frame(
+                                    state.turn,
+                                    buf["pcm_bytes"],
+                                    is_speech=buf["is_speech"],
+                                )
+                                state.is_speech_flags.append(buf["is_speech"])
+                            print("\nListening...", flush=True)
                     elif not state.turn.speech_active:
                         turn_manager.start_turn(state.turn)
                         print("\nListening...", flush=True)
@@ -1238,12 +1441,42 @@ def main() -> None:
             if event.event_type == "speech_frame" and event.pcm_bytes:
                 with state.lock:
                     if state.finalizing:
-                        if state.pending_speech_active:
-                            state.pending_speech_buffer.append({
-                                "pcm_bytes": event.pcm_bytes,
-                                "is_speech": event.is_speech,
-                            })
-                        continue
+                        if _tts_is_playing():
+                            # TTS active → buffer for interruption pipeline
+                            if state.pending_speech_active:
+                                state.pending_speech_buffer.append({
+                                    "pcm_bytes": event.pcm_bytes,
+                                    "is_speech": event.is_speech,
+                                })
+                            continue
+                        else:
+                            # TTS not playing → cancel old response if we
+                            # haven't already, then process frame normally.
+                            # Preserve buffered frames so early words aren't lost.
+                            if not state.turn.speech_active:
+                                saved_frames = list(state.pending_speech_buffer)
+                                logger.info(
+                                    "Speech frame during Thinking phase — cancelling pending response | buffered_frames=%d",
+                                    len(saved_frames),
+                                )
+                                cancel_pending_response()
+                                state.finalizing = False
+                                state.pending_speech_buffer.clear()
+                                state.pending_speech_active = False
+                                state.reset()
+                                if event.is_speech:
+                                    turn_manager.start_turn(state.turn)
+                                    # Replay saved frames
+                                    for buf in saved_frames:
+                                        turn_manager.append_frame(
+                                            state.turn,
+                                            buf["pcm_bytes"],
+                                            is_speech=buf["is_speech"],
+                                        )
+                                        state.is_speech_flags.append(buf["is_speech"])
+                                    print("\nListening...", flush=True)
+                                else:
+                                    continue
                     if not state.turn.speech_active:
                         if event.is_speech:
                             turn_manager.start_turn(state.turn)
