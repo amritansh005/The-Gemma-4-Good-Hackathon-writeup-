@@ -333,6 +333,14 @@ class LiveTranscriptState:
         # Cleared only when successfully consumed by a valid turn.
         self.pending_interruption_prefix: str = ""
 
+        # ── Speech buffer for frames arriving during finalization ──
+        # While finalize_turn is running (state.finalizing=True), the
+        # event loop would normally drop all speech frames.  Instead,
+        # we buffer them here so they can be replayed into a fresh turn
+        # once finalization completes.
+        self.pending_speech_buffer: List[Dict[str, Any]] = []
+        self.pending_speech_active: bool = False
+
     def reset(self) -> None:
         with self.lock:
             self.turn.reset()
@@ -345,6 +353,8 @@ class LiveTranscriptState:
             self.interruption_meta_for_turn = None
             # NOTE: pending_interruption_prefix intentionally NOT cleared —
             # it must survive resets so the next turn can use it.
+            # NOTE: pending_speech_buffer intentionally NOT cleared —
+            # it must survive resets so buffered frames can be replayed.
 
 
 def print_live(text: str) -> None:
@@ -439,6 +449,7 @@ def _run_partial_interrupt_confirmation(
             # we can try again with more audio when it finishes.
             state.interruption._retry_requested = True
             return
+
         candidate_ms = state.interruption.candidate_speech_ms
         if candidate_ms < partial_asr_threshold_ms:
             return
@@ -451,6 +462,9 @@ def _run_partial_interrupt_confirmation(
         state.interruption._retry_requested = False
 
     def worker() -> None:
+        should_retry = False
+        retry_speech_ms = 0.0
+
         try:
             result = stt.transcribe_bytes(audio_bytes, partial=True)
             text = result["text"].strip()
@@ -496,7 +510,9 @@ def _run_partial_interrupt_confirmation(
                     "interrupted": True,
                     "reason": reason,
                     "interrupted_assistant_text": tts_text_snapshot,
-                    "speech_ms_before_cancel": round(state.interruption.candidate_speech_ms, 1),
+                    "speech_ms_before_cancel": round(
+                        state.interruption.candidate_speech_ms, 1
+                    ),
                 }
 
                 # NOTE: We do NOT save pending_interruption_prefix.
@@ -507,8 +523,10 @@ def _run_partial_interrupt_confirmation(
             logger.info("Interruption confirmed via partial ASR | reason=%s", reason)
             _tts_stop_playback()
             print("\n[Assistant interrupted by user]\n", flush=True)
+
         except Exception:
             logger.exception("Partial interruption confirmation failed")
+
         finally:
             with state.lock:
                 state.interruption.partial_confirm_in_flight = False
@@ -523,14 +541,16 @@ def _run_partial_interrupt_confirmation(
                     should_retry = (
                         state.interruption.active
                         and not state.interruption.confirmed
-                        and getattr(state.interruption, '_retry_requested', False)
+                        and getattr(state.interruption, "_retry_requested", False)
                     )
+                    if should_retry:
+                        retry_speech_ms = state.interruption.candidate_speech_ms
                     state.interruption._retry_requested = False
 
             if should_retry:
                 logger.info(
                     "Retrying partial ASR confirmation with more audio | speech_ms=%.1f",
-                    state.interruption.candidate_speech_ms,
+                    retry_speech_ms,
                 )
                 _run_partial_interrupt_confirmation(state, stt, 0.0)
 
@@ -1084,8 +1104,14 @@ def finalize_turn(
             return
         _tts_restore_playback()
         with state.lock:
-            if not state.needs_streamer_reset:
-                state.needs_streamer_reset = True
+            # NOTE: We intentionally do NOT set needs_streamer_reset here.
+            # Resetting the streamer after finalize_turn kills any speech
+            # the user started while finalization was running (the
+            # beginning of their sentence is lost).  The VAD naturally
+            # settles to idle after silence, and the turn manager handles
+            # end-of-turn detection via silence thresholds.
+            # needs_streamer_reset is only set by _prepare_for_tts_resume
+            # (false interruption recovery) where a clean slate is needed.
             if state.finalizing:
                 pass  # will be cleared by state.reset() below
         state.reset()
@@ -1150,8 +1176,44 @@ def main() -> None:
             # Check if finalize_turn (bg thread) requested a reset
             with state.lock:
                 if state.needs_streamer_reset:
-                    state.needs_streamer_reset = False
-                    streamer.reset()
+                    if state.turn.speech_active:
+                        # Don't reset — user is already speaking
+                        state.needs_streamer_reset = False
+                        logger.info("Skipped streamer reset — speech already active")
+                    else:
+                        state.needs_streamer_reset = False
+                        streamer.reset()
+
+            # ── Replay buffered speech ──
+            with state.lock:
+                has_buffer = (
+                    not state.finalizing
+                    and state.pending_speech_active
+                    and len(state.pending_speech_buffer) > 0
+                )
+            if has_buffer:
+                with state.lock:
+                    buffered = list(state.pending_speech_buffer)
+                    state.pending_speech_buffer.clear()
+                    state.pending_speech_active = False
+                logger.info(
+                    "Replaying %d buffered speech frames from during finalization",
+                    len(buffered),
+                )
+                with state.lock:
+                    if not state.turn.speech_active and not state.finalizing:
+                        turn_manager.start_turn(state.turn)
+                        print("\nListening...", flush=True)
+                for buf_frame in buffered:
+                    with state.lock:
+                        if not state.turn.speech_active or state.finalizing:
+                            break
+                        turn_manager.append_frame(
+                            state.turn,
+                            buf_frame["pcm_bytes"],
+                            is_speech=buf_frame["is_speech"],
+                        )
+                        state.is_speech_flags.append(buf_frame["is_speech"])
 
             if event.event_type == "speech_frame":
                 maybe_handle_tts_interruption(
@@ -1163,15 +1225,31 @@ def main() -> None:
 
             if event.event_type == "speech_start":
                 with state.lock:
-                    if not state.turn.speech_active and not state.finalizing:
+                    if state.finalizing:
+                        if not state.pending_speech_active:
+                            state.pending_speech_active = True
+                            state.pending_speech_buffer.clear()
+                            logger.info("Buffering speech during finalization")
+                    elif not state.turn.speech_active:
                         turn_manager.start_turn(state.turn)
                         print("\nListening...", flush=True)
                 continue
 
             if event.event_type == "speech_frame" and event.pcm_bytes:
                 with state.lock:
-                    if not state.turn.speech_active or state.finalizing:
+                    if state.finalizing:
+                        if state.pending_speech_active:
+                            state.pending_speech_buffer.append({
+                                "pcm_bytes": event.pcm_bytes,
+                                "is_speech": event.is_speech,
+                            })
                         continue
+                    if not state.turn.speech_active:
+                        if event.is_speech:
+                            turn_manager.start_turn(state.turn)
+                            print("\nListening...", flush=True)
+                        else:
+                            continue
 
                     turn_manager.append_frame(
                         state.turn,
