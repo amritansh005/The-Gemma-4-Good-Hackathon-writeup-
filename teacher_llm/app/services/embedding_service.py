@@ -34,7 +34,7 @@ class EmbeddingService:
             response = self.llm.bg_client.embed(
                 model=self.model,
                 input=clean_text,
-                options={"num_gpu": 0},
+                options={"num_gpu": -1, "num_ctx": 2048},
             )
             embedding = response.get("embeddings", [[]])[0]
             if not isinstance(embedding, list):

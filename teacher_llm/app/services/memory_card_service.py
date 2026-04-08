@@ -214,11 +214,21 @@ Skip (should_create_memory=false) if this is a greeting, small talk, topic sugge
             "┌─ Inline Memory Card Stored ✓ ───────────────────────────\n"
             "│  topic          : %s\n"
             "│  status         : %s\n"
+            "│  snippet        : %s\n"
             "│  retrieval_text : %s\n"
+            "│  confusion      : %s\n"
+            "│  helpful_example: %s\n"
+            "│  student_pref   : %s\n"
+            "│  embedding_dims : %d\n"
             "└─────────────────────────────────────────────────────────",
             parsed.topic or "(empty)",
             parsed.status or "(empty)",
+            (parsed.snippet or "(empty)")[:120],
             retrieval_text[:120],
+            parsed.confusion or "(none)",
+            (parsed.helpful_example or "(none)")[:120],
+            parsed.student_preference or "(none)",
+            len(embedding),
         )
 
     def _extract_and_store(self, session_id: str, messages: List[dict]) -> None:

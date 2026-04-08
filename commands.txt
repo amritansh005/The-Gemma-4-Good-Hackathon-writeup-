@@ -1,5 +1,6 @@
 1. To start OLLAMA:
 
+Add-Content $PROFILE "`n`$env:OLLAMA_MAX_LOADED_MODELS = '2'"
 ollama serve
 
 2. Teacher LLM:

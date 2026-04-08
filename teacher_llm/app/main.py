@@ -9,6 +9,20 @@ from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+# ── Logging setup ────────────────────────────────────────────────
+# Configure root logger so all `app.services.*` loggers print to
+# the console alongside uvicorn's access logs. Without this, every
+# logger.info() call from our services is silently dropped.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+# Quiet down noisy third-party loggers
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("watchfiles").setLevel(logging.WARNING)
+
 from app.services.chat_memory import ChatMemoryService
 from app.services.embedding_service import EmbeddingService
 from app.services.emotion_state_service import EmotionStateService
